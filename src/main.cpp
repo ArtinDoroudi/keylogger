@@ -1,4 +1,6 @@
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -8,6 +10,23 @@
 
 #include "logger.hpp"
 #include "platform/keylogger.hpp"
+
+static std::atomic<bool> g_running{true};
+
+static void signalHandler(int) {
+    g_running = false;
+}
+
+#ifdef _WIN32
+#include <windows.h>
+static BOOL WINAPI consoleCtrlHandler(DWORD event) {
+    if (event == CTRL_C_EVENT || event == CTRL_CLOSE_EVENT) {
+        g_running = false;
+        return TRUE;
+    }
+    return FALSE;
+}
+#endif
 
 void printBanner() {
     std::cout << "======================================\n";
@@ -82,6 +101,12 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\nConsent acknowledged.\n";
 
+    std::signal(SIGINT,  signalHandler);
+    std::signal(SIGTERM, signalHandler);
+#ifdef _WIN32
+    SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
+#endif
+
 #ifdef _WIN32
     Logger logger("windows");
 #elif defined(__APPLE__)
@@ -115,13 +140,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "Capturing for 30 seconds...\n";
-    std::this_thread::sleep_for(std::chrono::seconds(30));
+    std::cout << "Capturing — press Ctrl+C to stop.\n";
+    while (g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     keylogger->stop();
     delete keylogger;
     logger.stop();
 
-    std::cout << "Log written to: " << logger.currentFilename() << "\n";
+    std::cout << "Stopped. Log saved to: " << logger.currentFilename() << "\n";
     return 0;
 }
