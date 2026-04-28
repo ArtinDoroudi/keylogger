@@ -21,8 +21,11 @@
 #endif
 
 #include "logger.hpp"
+#include "net_common.hpp"
+#include "net_sender.hpp"
 #include "platform/keylogger.hpp"
 #include "service.hpp"
+#include "viewer.hpp"
 
 #ifndef _WIN32
 #include <climits>
@@ -90,6 +93,28 @@ static void printUsage(const char* argv0) {
     std::cout << "  --status                Print whether the service is registered, enabled,\n";
     std::cout << "                          and running. Exit 0 if registered, 1 if not.\n";
     std::cout << "  --force                 With --install, overwrite an existing registration.\n\n";
+    std::cout << "Network logging (optional, off by default):\n";
+    std::cout << "  --net-endpoint <url>    Stream JSON events to this endpoint after optional\n";
+    std::cout << "                          local write. Schemes: http://, https://, tcp://\n";
+    std::cout << "  --net-mode <off|mirror|net-only>\n";
+    std::cout << "                          off (default), mirror (local + net), net-only.\n";
+    std::cout << "  --net-auth-token <s>    Sent as 'Authorization: Bearer <s>'. Required for\n";
+    std::cout << "                          non-loopback endpoints (see --net-insecure-local).\n";
+    std::cout << "  --net-insecure-local    Allow missing token only when endpoint is loopback.\n";
+    std::cout << "  --net-ca-file <path>    PEM bundle for HTTPS verification.\n";
+    std::cout << "  --net-timeout-ms <n>    Connect/send timeout (default 5000).\n";
+    std::cout << "  --net-retry-max <n>     Max retries per batch (default 3).\n";
+    std::cout << "  --net-batch-ms <n>      Coalesce events for n ms (default 0 = immediate).\n\n";
+    std::cout << "Remote viewer (subcommand: --viewer):\n";
+    std::cout << "  --viewer                Run the receive/stream/serve viewer instead of logging.\n";
+    std::cout << "  --listen <host:port>    Bind address (default 127.0.0.1:8765).\n";
+    std::cout << "  --listen-public         Acknowledge non-loopback bind; requires --viewer-token.\n";
+    std::cout << "  --viewer-token <s>      Required for non-loopback binds. Min 16 chars,\n";
+    std::cout << "                          alphanumeric + '-_.+/=' only.\n";
+    std::cout << "  --tls-cert <path>       Optional TLS server certificate (PEM).\n";
+    std::cout << "  --tls-key <path>        Optional TLS server private key (PEM).\n";
+    std::cout << "  --storage-dir <path>    Optional: append received events to daily .jsonl.\n";
+    std::cout << "  --max-clients <n>       Cap concurrent SSE clients (default 32).\n\n";
     std::cout << "General:\n";
     std::cout << "  --help, -h              Print this message and exit\n\n";
     std::cout << "Examples:\n";
@@ -103,7 +128,19 @@ static void printUsage(const char* argv0) {
     std::cout << "                       --session-tag honeypot-web-01\n\n";
     std::cout << "  # Inspect / remove the installed service\n";
     std::cout << "  " << argv0 << " --status\n";
-    std::cout << "  sudo " << argv0 << " --uninstall\n";
+    std::cout << "  sudo " << argv0 << " --uninstall\n\n";
+    std::cout << "  # Mirror local log + send to a collector on the LAN (with auth)\n";
+    std::cout << "  " << argv0 << " --service --consent-file /etc/keylogger/consent.txt \\\n";
+    std::cout << "              --log-dir /var/log/keylogger \\\n";
+    std::cout << "              --net-mode mirror \\\n";
+    std::cout << "              --net-endpoint http://10.0.0.5:8765/ingest \\\n";
+    std::cout << "              --net-auth-token \"$(cat /root/keylog-token)\"\n\n";
+    std::cout << "  # Run a local viewer (loopback only, no auth required)\n";
+    std::cout << "  " << argv0 << " --viewer\n\n";
+    std::cout << "  # Run a viewer on the LAN with token auth\n";
+    std::cout << "  " << argv0 << " --viewer --listen 0.0.0.0:8765 --listen-public \\\n";
+    std::cout << "              --viewer-token \"$(openssl rand -hex 32)\" \\\n";
+    std::cout << "              --storage-dir /var/log/keylog-collector\n";
 }
 
 static std::string msToIso8601(int64_t ms) {
@@ -243,6 +280,38 @@ static bool validateConsentFile(const std::string& path) {
     return true;
 }
 
+// Event sink that fans out one JSON line to (a) the local file logger and/or
+// (b) the network sender, depending on the configured mode. Network failures
+// never affect local logging.
+struct EventSink {
+    Logger*     logger = nullptr;
+    net::Sender* sender = nullptr;
+    bool         localEnabled = true;
+    bool         netEnabled   = false;
+
+    void emit(const std::string& line) {
+        if (localEnabled && logger) logger->logEvent(line);
+        if (netEnabled && sender)   sender->enqueue(line);
+    }
+};
+
+static bool parseHostPort(const std::string& s, std::string& host, int& port) {
+    if (s.empty()) return false;
+    if (s.front() == '[') {
+        auto rb = s.find(']');
+        if (rb == std::string::npos) return false;
+        host = s.substr(1, rb - 1);
+        if (rb + 1 >= s.size() || s[rb + 1] != ':') return false;
+        port = std::atoi(s.c_str() + rb + 2);
+    } else {
+        auto colon = s.rfind(':');
+        if (colon == std::string::npos) return false;
+        host = s.substr(0, colon);
+        port = std::atoi(s.c_str() + colon + 1);
+    }
+    return !host.empty() && port > 0 && port <= 65535;
+}
+
 int main(int argc, char* argv[]) {
     bool consent = false;
     bool help = false;
@@ -255,6 +324,26 @@ int main(int argc, char* argv[]) {
     std::string logDir = ".";
     bool logDirExplicit = false;
     std::string sessionTag;
+
+    // Network sender flags.
+    std::string netMode = "off";
+    std::string netEndpoint;
+    std::string netAuthToken;
+    std::string netCaFile;
+    bool        netInsecureLocal = false;
+    int         netTimeoutMs = 5000;
+    int         netRetryMax  = 3;
+    int         netBatchMs   = 0;
+
+    // Viewer subcommand flags.
+    bool        viewerMode  = false;
+    std::string viewerListen;
+    bool        viewerListenPublic = false;
+    std::string viewerToken;
+    std::string viewerTlsCert;
+    std::string viewerTlsKey;
+    std::string viewerStorageDir;
+    int         viewerMaxClients = 32;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--consent") == 0) {
@@ -290,6 +379,51 @@ int main(int argc, char* argv[]) {
                 return 2;
             }
             sessionTag = argv[++i];
+        } else if (std::strcmp(argv[i], "--net-mode") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --net-mode requires an argument\n"; return 2; }
+            netMode = argv[++i];
+        } else if (std::strcmp(argv[i], "--net-endpoint") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --net-endpoint requires a URL\n"; return 2; }
+            netEndpoint = argv[++i];
+        } else if (std::strcmp(argv[i], "--net-auth-token") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --net-auth-token requires a value\n"; return 2; }
+            netAuthToken = argv[++i];
+        } else if (std::strcmp(argv[i], "--net-insecure-local") == 0) {
+            netInsecureLocal = true;
+        } else if (std::strcmp(argv[i], "--net-ca-file") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --net-ca-file requires a path\n"; return 2; }
+            netCaFile = argv[++i];
+        } else if (std::strcmp(argv[i], "--net-timeout-ms") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --net-timeout-ms requires a number\n"; return 2; }
+            netTimeoutMs = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--net-retry-max") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --net-retry-max requires a number\n"; return 2; }
+            netRetryMax = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--net-batch-ms") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --net-batch-ms requires a number\n"; return 2; }
+            netBatchMs = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--viewer") == 0) {
+            viewerMode = true;
+        } else if (std::strcmp(argv[i], "--listen") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --listen requires host:port\n"; return 2; }
+            viewerListen = argv[++i];
+        } else if (std::strcmp(argv[i], "--listen-public") == 0) {
+            viewerListenPublic = true;
+        } else if (std::strcmp(argv[i], "--viewer-token") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --viewer-token requires a value\n"; return 2; }
+            viewerToken = argv[++i];
+        } else if (std::strcmp(argv[i], "--tls-cert") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --tls-cert requires a path\n"; return 2; }
+            viewerTlsCert = argv[++i];
+        } else if (std::strcmp(argv[i], "--tls-key") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --tls-key requires a path\n"; return 2; }
+            viewerTlsKey = argv[++i];
+        } else if (std::strcmp(argv[i], "--storage-dir") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --storage-dir requires a path\n"; return 2; }
+            viewerStorageDir = argv[++i];
+        } else if (std::strcmp(argv[i], "--max-clients") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --max-clients requires a number\n"; return 2; }
+            viewerMaxClients = std::atoi(argv[++i]);
         } else {
             std::cerr << "error: unknown option: " << argv[i] << "\n";
             return 2;
@@ -299,6 +433,123 @@ int main(int argc, char* argv[]) {
     if (help) {
         printUsage(argv[0]);
         return 0;
+    }
+
+    // ---- Viewer subcommand: separate from logger modes ----
+    if (viewerMode) {
+        if (consent || serviceMode || installMode || uninstallMode || statusMode) {
+            std::cerr << "error: --viewer cannot be combined with logger modes\n";
+            return 2;
+        }
+        if (netMode != "off" || !netEndpoint.empty()) {
+            std::cerr << "error: --net-* flags belong on the keylogger sender, "
+                         "not the viewer\n";
+            return 2;
+        }
+
+        viewer::Config vcfg;
+        vcfg.bindHost   = "127.0.0.1";
+        vcfg.bindPort   = 8765;
+        if (!viewerListen.empty()) {
+            std::string h; int p = 0;
+            if (!parseHostPort(viewerListen, h, p)) {
+                std::cerr << "error: --listen must be host:port (got: " << viewerListen << ")\n";
+                return 2;
+            }
+            vcfg.bindHost = h;
+            vcfg.bindPort = p;
+        }
+        bool boundLoopback = netcommon::isLoopbackHost(vcfg.bindHost);
+        bool wildcardBind  = (vcfg.bindHost == "0.0.0.0" || vcfg.bindHost == "::" || vcfg.bindHost == "*");
+        if ((wildcardBind || !boundLoopback) && !viewerListenPublic) {
+            std::cerr << "error: --listen " << vcfg.bindHost
+                      << " requires --listen-public to acknowledge LAN/WAN exposure\n";
+            return 2;
+        }
+        vcfg.listenPublic = viewerListenPublic;
+        vcfg.token        = viewerToken;
+        vcfg.tlsCert      = viewerTlsCert;
+        vcfg.tlsKey       = viewerTlsKey;
+        vcfg.storageDir   = viewerStorageDir;
+        vcfg.maxClients   = viewerMaxClients > 0 ? viewerMaxClients : 32;
+
+        if (!boundLoopback || wildcardBind) {
+            if (vcfg.token.empty()) {
+                std::cerr << "error: --viewer-token is required when --listen is non-loopback\n";
+                return 2;
+            }
+            if (vcfg.token.size() < 16) {
+                std::cerr << "error: --viewer-token must be at least 16 characters\n";
+                return 2;
+            }
+            if (!netcommon::isSafeToken(vcfg.token)) {
+                std::cerr << "error: --viewer-token contains disallowed characters; "
+                             "allowed: alphanumerics and '-_.+/=' \n";
+                return 2;
+            }
+        } else if (!vcfg.token.empty()) {
+            if (vcfg.token.size() < 16 || !netcommon::isSafeToken(vcfg.token)) {
+                std::cerr << "error: --viewer-token must be >=16 chars and use "
+                             "alphanumerics and '-_.+/=' only\n";
+                return 2;
+            }
+        }
+        if (!vcfg.storageDir.empty() && !isDirectoryWritable(vcfg.storageDir)) {
+            std::cerr << "error: --storage-dir does not exist or is not writable: "
+                      << vcfg.storageDir << "\n";
+            return 2;
+        }
+        return viewer::run(vcfg);
+    }
+
+    // ---- Network sender flag validation (applies to logger modes) ----
+    if (netMode != "off" && netMode != "mirror" && netMode != "net-only") {
+        std::cerr << "error: --net-mode must be off, mirror, or net-only (got: "
+                  << netMode << ")\n";
+        return 2;
+    }
+    if (netMode == "off" && (!netEndpoint.empty() || !netAuthToken.empty() ||
+                             !netCaFile.empty() || netInsecureLocal)) {
+        std::cerr << "warning: --net-* flags are ignored because --net-mode is off\n";
+    }
+    if (netMode != "off") {
+        if (netEndpoint.empty()) {
+            std::cerr << "error: --net-mode " << netMode
+                      << " requires --net-endpoint <url>\n";
+            return 2;
+        }
+        netcommon::ParsedUrl pu;
+        std::string urlErr;
+        if (!netcommon::parseUrl(netEndpoint, pu, urlErr)) {
+            std::cerr << "error: invalid --net-endpoint: " << urlErr << "\n";
+            return 2;
+        }
+        bool epLoopback = netcommon::isLoopbackHost(pu.host);
+        if (!epLoopback && netAuthToken.empty()) {
+            std::cerr << "error: --net-auth-token is required for non-loopback endpoints\n";
+            return 2;
+        }
+        if (epLoopback && netAuthToken.empty() && !netInsecureLocal) {
+            std::cerr << "error: missing --net-auth-token; pass --net-insecure-local "
+                         "to allow unauthenticated loopback transmission\n";
+            return 2;
+        }
+        if (epLoopback && netAuthToken.empty() && netInsecureLocal) {
+            std::cerr << "warning: sending to loopback endpoint without authentication "
+                         "(--net-insecure-local set)\n";
+        }
+        if (!netAuthToken.empty() && !netcommon::isSafeToken(netAuthToken)) {
+            std::cerr << "error: --net-auth-token contains disallowed characters; "
+                         "allowed: alphanumerics and '-_.+/=' \n";
+            return 2;
+        }
+        if (!netCaFile.empty() && !isRegularFileReadable(netCaFile)) {
+            std::cerr << "error: --net-ca-file not readable: " << netCaFile << "\n";
+            return 2;
+        }
+        if (netTimeoutMs <= 0) netTimeoutMs = 5000;
+        if (netRetryMax  < 0)  netRetryMax  = 0;
+        if (netBatchMs   < 0)  netBatchMs   = 0;
     }
 
     // ---- Mutual-exclusion: --install / --uninstall / --status / --consent ----
@@ -433,8 +684,36 @@ int main(int argc, char* argv[]) {
         SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
 #endif
 
+        bool localEnabled = (netMode != "net-only");
+        bool netEnabled   = (netMode == "mirror" || netMode == "net-only");
+
         Logger logger(OS_NAME, logDir, sessionTag);
-        logger.start();
+        if (localEnabled) logger.start();
+
+        net::Sender netSender;
+        if (netEnabled) {
+            net::SenderConfig sc;
+            sc.endpoint       = netEndpoint;
+            sc.authToken      = netAuthToken;
+            sc.caFile         = netCaFile;
+            sc.timeoutMs      = netTimeoutMs;
+            sc.retryMax       = netRetryMax;
+            sc.batchMs        = netBatchMs;
+            sc.insecureLocal  = netInsecureLocal;
+            std::string nerr;
+            if (!netSender.start(sc, nerr)) {
+                std::cerr << "error: failed to start network sender: " << nerr << "\n";
+                if (localEnabled) logger.stop();
+                return 1;
+            }
+            std::cerr << "[net] mode=" << netMode << " endpoint=" << netEndpoint << "\n";
+        }
+
+        EventSink sink;
+        sink.logger       = &logger;
+        sink.sender       = netEnabled ? &netSender : nullptr;
+        sink.localEnabled = localEnabled;
+        sink.netEnabled   = netEnabled;
 
         // Write service_start event with embedded banner
         {
@@ -460,16 +739,17 @@ int main(int argc, char* argv[]) {
             event += jsonEscape(BANNER_TEXT);
             event += R"("})";
 
-            logger.logEvent(event);
+            sink.emit(event);
         }
 
         IKeylogger* keylogger = createPlatformKeylogger();
         if (!keylogger) {
-            logger.stop();
+            if (localEnabled) logger.stop();
+            netSender.stop();
             return 1;
         }
 
-        keylogger->setEventCallback([&logger, &sessionTag](const KeyEvent& ev) {
+        keylogger->setEventCallback([&sink, &sessionTag](const KeyEvent& ev) {
             std::string tagField = sessionTag.empty()
                 ? "null"
                 : "\"" + jsonEscape(sessionTag) + "\"";
@@ -483,13 +763,14 @@ int main(int argc, char* argv[]) {
                      ev.keyDown ? "true" : "false",
                      OS_NAME,
                      tagField.c_str());
-            logger.logEvent(buf);
+            sink.emit(buf);
         });
 
         if (!keylogger->start()) {
             std::cerr << "Failed to start keylogger\n";
             delete keylogger;
-            logger.stop();
+            if (localEnabled) logger.stop();
+            netSender.stop();
             return 1;
         }
 
@@ -499,7 +780,8 @@ int main(int argc, char* argv[]) {
 
         keylogger->stop();
         delete keylogger;
-        logger.stop();
+        netSender.stop();
+        if (localEnabled) logger.stop();
         return 0;
     }
 
@@ -521,8 +803,36 @@ int main(int argc, char* argv[]) {
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
 #endif
 
+    bool localEnabled = (netMode != "net-only");
+    bool netEnabled   = (netMode == "mirror" || netMode == "net-only");
+
     Logger logger(OS_NAME, logDir, sessionTag);
-    logger.start();
+    if (localEnabled) logger.start();
+
+    net::Sender netSender;
+    if (netEnabled) {
+        net::SenderConfig sc;
+        sc.endpoint       = netEndpoint;
+        sc.authToken      = netAuthToken;
+        sc.caFile         = netCaFile;
+        sc.timeoutMs      = netTimeoutMs;
+        sc.retryMax       = netRetryMax;
+        sc.batchMs        = netBatchMs;
+        sc.insecureLocal  = netInsecureLocal;
+        std::string nerr;
+        if (!netSender.start(sc, nerr)) {
+            std::cerr << "error: failed to start network sender: " << nerr << "\n";
+            if (localEnabled) logger.stop();
+            return 1;
+        }
+        std::cerr << "[net] mode=" << netMode << " endpoint=" << netEndpoint << "\n";
+    }
+
+    EventSink sink;
+    sink.logger       = &logger;
+    sink.sender       = netEnabled ? &netSender : nullptr;
+    sink.localEnabled = localEnabled;
+    sink.netEnabled   = netEnabled;
 
     {
         auto nowMs = static_cast<int64_t>(
@@ -537,16 +847,17 @@ int main(int argc, char* argv[]) {
         snprintf(hdr, sizeof(hdr),
                  R"({"event":"session_start","os":"%s","version":"0.1.0","ts":"%s","session_tag":%s})",
                  OS_NAME, msToIso8601(nowMs).c_str(), tagField.c_str());
-        logger.logEvent(hdr);
+        sink.emit(hdr);
     }
 
     IKeylogger* keylogger = createPlatformKeylogger();
     if (!keylogger) {
-        logger.stop();
+        if (localEnabled) logger.stop();
+        netSender.stop();
         return 1;
     }
 
-    keylogger->setEventCallback([&logger, &sessionTag](const KeyEvent& ev) {
+    keylogger->setEventCallback([&sink, &sessionTag](const KeyEvent& ev) {
         std::string tagField = sessionTag.empty()
             ? "null"
             : "\"" + jsonEscape(sessionTag) + "\"";
@@ -560,13 +871,14 @@ int main(int argc, char* argv[]) {
                  ev.keyDown ? "true" : "false",
                  OS_NAME,
                  tagField.c_str());
-        logger.logEvent(buf);
+        sink.emit(buf);
     });
 
     if (!keylogger->start()) {
         std::cerr << "Failed to start keylogger\n";
         delete keylogger;
-        logger.stop();
+        if (localEnabled) logger.stop();
+        netSender.stop();
         return 1;
     }
 
@@ -577,8 +889,13 @@ int main(int argc, char* argv[]) {
 
     keylogger->stop();
     delete keylogger;
-    logger.stop();
+    netSender.stop();
+    if (localEnabled) logger.stop();
 
-    std::cout << "Stopped. Log saved to: " << logger.currentFilename() << "\n";
+    if (localEnabled) {
+        std::cout << "Stopped. Log saved to: " << logger.currentFilename() << "\n";
+    } else {
+        std::cout << "Stopped. (net-only mode: no local log)\n";
+    }
     return 0;
 }
