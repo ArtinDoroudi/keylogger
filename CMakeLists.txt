@@ -24,6 +24,7 @@ elseif(APPLE)
 endif()
 
 add_executable(keylogger ${SOURCES})
+add_executable(log_viewer src/log_viewer.cpp)
 
 if(WIN32)
     target_link_libraries(keylogger PRIVATE user32)
