@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "logger.hpp"
+#include "platform/keylogger.hpp"
 
 void printBanner() {
     std::cout << "======================================\n";
@@ -50,6 +51,14 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\nConsent acknowledged.\n";
+
+    IKeylogger* keylogger = createPlatformKeylogger();
+    if (!keylogger) {
+        Logger logger("macos");
+        logger.start();
+        logger.stop();
+        return 1;
+    }
 
     Logger logger("macos");
     logger.start();
