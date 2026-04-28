@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(SOURCES
     src/main.cpp
     src/logger.cpp
+    src/service.cpp
     src/platform/keylogger_factory.cpp
     # Platform-specific sources (uncomment when implemented):
     # src/platform/windows_hook.cpp   # WIN32 only (superseded by keylogger_win.cpp)

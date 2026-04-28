@@ -22,6 +22,15 @@
 
 #include "logger.hpp"
 #include "platform/keylogger.hpp"
+#include "service.hpp"
+
+#ifndef _WIN32
+#include <climits>
+#include <cstdlib>
+#endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 static std::atomic<bool> g_running{true};
 
@@ -72,16 +81,29 @@ static void printUsage(const char* argv0) {
     std::cout << "  --log-dir <path>        Directory to write logs to (default: cwd)\n";
     std::cout << "  --session-tag <string>  Tag written into every JSON event (max 64 chars,\n";
     std::cout << "                          alphanumeric + dash + underscore only)\n\n";
+    std::cout << "Service installation (auto-start at boot):\n";
+    std::cout << "  --install               Register a system service and enable auto-start.\n";
+    std::cout << "                          Requires elevation (sudo/Administrator) and\n";
+    std::cout << "                          --consent-file + --log-dir.\n";
+    std::cout << "  --uninstall             Stop, disable, and remove the service registration.\n";
+    std::cout << "                          Requires elevation. Idempotent (warns if missing).\n";
+    std::cout << "  --status                Print whether the service is registered, enabled,\n";
+    std::cout << "                          and running. Exit 0 if registered, 1 if not.\n";
+    std::cout << "  --force                 With --install, overwrite an existing registration.\n\n";
     std::cout << "General:\n";
     std::cout << "  --help, -h              Print this message and exit\n\n";
-    std::cout << "The keylogger is a plain executable. In service mode it does not install\n";
-    std::cout << "itself as a daemon or system service. The operator is responsible for\n";
-    std::cout << "wrapping it in their own systemd unit, launchd plist, Windows Task\n";
-    std::cout << "Scheduler entry, or Docker container.\n\n";
-    std::cout << "Example (service mode):\n";
+    std::cout << "Examples:\n";
+    std::cout << "  # Foreground service mode\n";
     std::cout << "  " << argv0 << " --service --consent-file /etc/keylogger/consent.txt \\\n";
     std::cout << "              --log-dir /var/log/keylogger \\\n";
-    std::cout << "              --session-tag honeypot-web-01\n";
+    std::cout << "              --session-tag honeypot-web-01\n\n";
+    std::cout << "  # Install as a managed system service (auto-start at boot)\n";
+    std::cout << "  sudo " << argv0 << " --install --consent-file /etc/keylogger/consent.txt \\\n";
+    std::cout << "                       --log-dir /var/log/keylogger \\\n";
+    std::cout << "                       --session-tag honeypot-web-01\n\n";
+    std::cout << "  # Inspect / remove the installed service\n";
+    std::cout << "  " << argv0 << " --status\n";
+    std::cout << "  sudo " << argv0 << " --uninstall\n";
 }
 
 static std::string msToIso8601(int64_t ms) {
@@ -151,6 +173,53 @@ static bool isDirectoryWritable(const std::string& path) {
 #endif
 }
 
+static std::string toAbsolutePath(const std::string& path) {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD n = GetFullPathNameA(path.c_str(), MAX_PATH, buf, nullptr);
+    if (n == 0 || n >= MAX_PATH) return path;
+    return std::string(buf, n);
+#else
+    char buf[PATH_MAX];
+    if (realpath(path.c_str(), buf) != nullptr) {
+        return std::string(buf);
+    }
+    // realpath fails if any path component does not exist. Fall back to a
+    // best-effort absolute join against cwd so callers still get an absolute
+    // value (the caller will have already validated existence separately).
+    if (!path.empty() && path[0] == '/') return path;
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) == nullptr) return path;
+    return std::string(cwd) + "/" + path;
+#endif
+}
+
+static std::string getExecutablePath(const char* argv0) {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) return std::string(buf, n);
+    return toAbsolutePath(argv0);
+#elif defined(__APPLE__)
+    char buf[PATH_MAX];
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) == 0) {
+        char real[PATH_MAX];
+        if (realpath(buf, real) != nullptr) return std::string(real);
+        return std::string(buf);
+    }
+    return toAbsolutePath(argv0);
+#else
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        return std::string(buf);
+    }
+    return toAbsolutePath(argv0);
+#endif
+}
+
 static bool validateConsentFile(const std::string& path) {
     if (!isRegularFileReadable(path)) {
         std::cerr << "error: consent file not found or not readable: " << path << "\n";
@@ -178,8 +247,13 @@ int main(int argc, char* argv[]) {
     bool consent = false;
     bool help = false;
     bool serviceMode = false;
+    bool installMode = false;
+    bool uninstallMode = false;
+    bool statusMode = false;
+    bool force = false;
     std::string consentFilePath;
     std::string logDir = ".";
+    bool logDirExplicit = false;
     std::string sessionTag;
 
     for (int i = 1; i < argc; ++i) {
@@ -189,6 +263,14 @@ int main(int argc, char* argv[]) {
             help = true;
         } else if (std::strcmp(argv[i], "--service") == 0) {
             serviceMode = true;
+        } else if (std::strcmp(argv[i], "--install") == 0) {
+            installMode = true;
+        } else if (std::strcmp(argv[i], "--uninstall") == 0) {
+            uninstallMode = true;
+        } else if (std::strcmp(argv[i], "--status") == 0) {
+            statusMode = true;
+        } else if (std::strcmp(argv[i], "--force") == 0) {
+            force = true;
         } else if (std::strcmp(argv[i], "--consent-file") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "error: --consent-file requires a path argument\n";
@@ -201,6 +283,7 @@ int main(int argc, char* argv[]) {
                 return 2;
             }
             logDir = argv[++i];
+            logDirExplicit = true;
         } else if (std::strcmp(argv[i], "--session-tag") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "error: --session-tag requires a string argument\n";
@@ -218,6 +301,19 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // ---- Mutual-exclusion: --install / --uninstall / --status / --consent ----
+    {
+        int exclusive = (installMode ? 1 : 0)
+                      + (uninstallMode ? 1 : 0)
+                      + (statusMode ? 1 : 0)
+                      + (consent ? 1 : 0);
+        if (exclusive > 1) {
+            std::cerr << "error: --install, --uninstall, --status, and --consent are "
+                         "mutually exclusive.\n";
+            return 2;
+        }
+    }
+
     // ---- Validate session-tag if provided (applies to both modes) ----
     if (!sessionTag.empty() && !isValidSessionTag(sessionTag)) {
         std::cerr << "error: --session-tag must be 1-64 characters, "
@@ -233,6 +329,79 @@ int main(int argc, char* argv[]) {
 #else
     static constexpr const char* OS_NAME = "linux";
 #endif
+
+    // ---- Service management commands (--install / --uninstall / --status) ----
+    if (statusMode) {
+        if (force || installMode || uninstallMode || serviceMode ||
+            !consentFilePath.empty() || logDirExplicit || !sessionTag.empty()) {
+            // Be lenient: --status ignores other args, but warn on misuse.
+            // (Mutual exclusion vs --install/--uninstall/--consent already enforced.)
+        }
+        return service::status();
+    }
+
+    if (uninstallMode) {
+#ifdef _WIN32
+        const char* elevHint = "error: --uninstall requires Administrator privileges. "
+                               "Run as Administrator.";
+#else
+        const char* elevHint = "error: --uninstall requires root privileges. "
+                               "Run with sudo.";
+#endif
+        if (!service::isElevated()) {
+            std::cerr << elevHint << "\n";
+            return 2;
+        }
+        return service::uninstall();
+    }
+
+    if (installMode) {
+#ifdef _WIN32
+        const char* elevHint = "error: --install requires Administrator privileges. "
+                               "Run as Administrator.";
+#else
+        const char* elevHint = "error: --install requires root privileges. "
+                               "Run with sudo.";
+#endif
+        if (!service::isElevated()) {
+            std::cerr << elevHint << "\n";
+            return 2;
+        }
+
+        if (consentFilePath.empty()) {
+            std::cerr << "error: --install requires --consent-file <path>\n";
+            return 2;
+        }
+        if (!logDirExplicit) {
+            std::cerr << "error: --install requires --log-dir <path>\n";
+            return 2;
+        }
+
+        // Validate before writing anything to disk.
+        if (!validateConsentFile(consentFilePath)) {
+            return 2;
+        }
+        if (!isDirectoryWritable(logDir)) {
+            std::cerr << "error: --log-dir does not exist or is not writable: "
+                      << logDir << "\n";
+            return 2;
+        }
+
+        ServiceInstallParams params;
+        params.binaryPath  = getExecutablePath(argv[0]);
+        params.consentFile = toAbsolutePath(consentFilePath);
+        params.logDir      = toAbsolutePath(logDir);
+        params.sessionTag  = sessionTag;
+        params.force       = force;
+
+        return service::install(params);
+    }
+
+    // --force is only meaningful with --install.
+    if (force) {
+        std::cerr << "error: --force is only valid with --install\n";
+        return 2;
+    }
 
     // ---- Service mode path ----
     if (serviceMode) {
