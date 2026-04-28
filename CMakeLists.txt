@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(ethical-keylogger-demo VERSION 0.1.0 LANGUAGES CXX)
 
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -15,6 +19,8 @@ set(SOURCES
 
 if(WIN32)
     list(APPEND SOURCES src/platform/keylogger_win.cpp)
+elseif(APPLE)
+    list(APPEND SOURCES src/platform/keylogger_mac.mm)
 endif()
 
 add_executable(keylogger ${SOURCES})
@@ -23,6 +29,6 @@ if(WIN32)
     target_link_libraries(keylogger PRIVATE user32)
 elseif(APPLE)
     find_library(APP_SERVICES ApplicationServices REQUIRED)
-    find_library(FOUNDATION Foundation REQUIRED)
-    target_link_libraries(keylogger PRIVATE ${APP_SERVICES} ${FOUNDATION})
+    find_library(CARBON Carbon REQUIRED)
+    target_link_libraries(keylogger PRIVATE ${APP_SERVICES} ${CARBON})
 endif()
