@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(SOURCES
     src/main.cpp
+    src/logger.cpp
     # Platform-specific sources (uncomment when implemented):
     # src/platform/windows_hook.cpp   # WIN32 only
     # src/platform/macos_hook.cpp     # APPLE only

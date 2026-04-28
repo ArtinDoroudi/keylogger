@@ -1,5 +1,9 @@
-#include <iostream>
+#include <chrono>
 #include <cstring>
+#include <iostream>
+#include <thread>
+
+#include "logger.hpp"
 
 void printBanner() {
     std::cout << "======================================\n";
@@ -46,5 +50,13 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\nConsent acknowledged.\n";
+
+    Logger logger("macos");
+    logger.start();
+    logger.logEvent(R"({"event":"test","msg":"logger working"})");
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    logger.stop();
+
+    std::cout << "Log written to: " << logger.currentFilename() << "\n";
     return 0;
 }
