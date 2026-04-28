@@ -6,8 +6,22 @@
 #include <sstream>
 #include <stdexcept>
 
-Logger::Logger(std::string osName)
-    : m_osName(std::move(osName)), m_tempPath(".keylog.partial.jsonl") {}
+static std::string pathJoin(const std::string& dir, const std::string& file) {
+#ifdef _WIN32
+    if (!dir.empty() && dir.back() != '\\' && dir.back() != '/')
+        return dir + "\\" + file;
+#else
+    if (!dir.empty() && dir.back() != '/')
+        return dir + "/" + file;
+#endif
+    return dir + file;
+}
+
+Logger::Logger(std::string osName, std::string logDir, std::string sessionTag)
+    : m_osName(std::move(osName)),
+      m_logDir(std::move(logDir)),
+      m_sessionTag(std::move(sessionTag)),
+      m_tempPath(pathJoin(m_logDir, ".keylog.partial.jsonl")) {}
 
 void Logger::start() {
     m_startTime = std::chrono::system_clock::now();
@@ -48,7 +62,7 @@ void Logger::stop() {
         << std::setw(2) << std::setfill('0') << ss << "s"
         << "-" << m_osName << ".jsonl";
 
-    m_finalPath = oss.str();
+    m_finalPath = pathJoin(m_logDir, oss.str());
     if (std::rename(m_tempPath.c_str(), m_finalPath.c_str()) != 0) {
         throw std::runtime_error("Logger: cannot rename temp file to: " + m_finalPath);
     }

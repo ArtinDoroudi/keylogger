@@ -1,12 +1,24 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "logger.hpp"
 #include "platform/keylogger.hpp"
@@ -18,34 +30,58 @@ static void signalHandler(int) {
 }
 
 #ifdef _WIN32
-#include <windows.h>
 static BOOL WINAPI consoleCtrlHandler(DWORD event) {
-    if (event == CTRL_C_EVENT || event == CTRL_CLOSE_EVENT) {
+    switch (event) {
+    case CTRL_C_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
         g_running = false;
         return TRUE;
+    default:
+        return FALSE;
     }
-    return FALSE;
 }
 #endif
 
-void printBanner() {
-    std::cout << "======================================\n";
-    std::cout << " ethical-keylogger-demo\n";
-    std::cout << "======================================\n";
-    std::cout << " WHAT IT DOES:    Logs keystrokes to a local file\n";
-    std::cout << " WHAT IT DOESN'T: No network transmission, no stealth\n";
-    std::cout << "                  mode, no persistence (no startup entry)\n";
-    std::cout << " LOG LOCATION:    Current working directory (keylog.txt)\n";
-    std::cout << " HOW TO STOP:     Press Ctrl+C\n";
-    std::cout << "======================================\n";
+static const char* BANNER_TEXT =
+    "======================================\n"
+    " ethical-keylogger-demo\n"
+    "======================================\n"
+    " WHAT IT DOES:    Logs keystrokes to a local file\n"
+    " WHAT IT DOESN'T: No network transmission, no stealth\n"
+    "                  mode, no persistence (no startup entry)\n"
+    " LOG LOCATION:    Current working directory (keylog.txt)\n"
+    " HOW TO STOP:     Press Ctrl+C\n"
+    "======================================";
+
+static const char* CONSENT_MAGIC = "I OWN THIS SYSTEM AND CONSENT TO LOGGING";
+
+static void printBanner() {
+    std::cout << BANNER_TEXT << "\n";
 }
 
-void printUsage(const char* argv0) {
+static void printUsage(const char* argv0) {
     std::cout << "Usage: " << argv0 << " [OPTIONS]\n\n";
-    std::cout << "Options:\n";
-    std::cout << "  --consent    Acknowledge consent and start logging\n";
-    std::cout << "  --help, -h   Print this message and exit\n\n";
-    std::cout << "You must pass --consent to run the logger.\n";
+    std::cout << "Interactive mode (default):\n";
+    std::cout << "  --consent               Acknowledge consent and start logging\n\n";
+    std::cout << "Service mode (unattended deployments):\n";
+    std::cout << "  --service               Run in unattended mode (requires --consent-file)\n";
+    std::cout << "  --consent-file <path>   Path to a file whose first line is exactly:\n";
+    std::cout << "                          \"" << CONSENT_MAGIC << "\"\n";
+    std::cout << "  --log-dir <path>        Directory to write logs to (default: cwd)\n";
+    std::cout << "  --session-tag <string>  Tag written into every JSON event (max 64 chars,\n";
+    std::cout << "                          alphanumeric + dash + underscore only)\n\n";
+    std::cout << "General:\n";
+    std::cout << "  --help, -h              Print this message and exit\n\n";
+    std::cout << "The keylogger is a plain executable. In service mode it does not install\n";
+    std::cout << "itself as a daemon or system service. The operator is responsible for\n";
+    std::cout << "wrapping it in their own systemd unit, launchd plist, Windows Task\n";
+    std::cout << "Scheduler entry, or Docker container.\n\n";
+    std::cout << "Example (service mode):\n";
+    std::cout << "  " << argv0 << " --service --consent-file /etc/keylogger/consent.txt \\\n";
+    std::cout << "              --log-dir /var/log/keylogger \\\n";
+    std::cout << "              --session-tag honeypot-web-01\n";
 }
 
 static std::string msToIso8601(int64_t ms) {
@@ -66,24 +102,114 @@ static std::string msToIso8601(int64_t ms) {
 
 static std::string jsonEscape(const std::string& s) {
     std::string out;
-    out.reserve(s.size());
+    out.reserve(s.size() + 16);
     for (char c : s) {
-        if      (c == '"')  out += "\\\"";
-        else if (c == '\\') out += "\\\\";
-        else                out += c;
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:   out += c;      break;
+        }
     }
     return out;
+}
+
+static bool isValidSessionTag(const std::string& tag) {
+    if (tag.empty() || tag.size() > 64) return false;
+    return std::all_of(tag.begin(), tag.end(), [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_';
+    });
+}
+
+static bool isRegularFileReadable(const std::string& path) {
+#ifdef _WIN32
+    struct _stat st;
+    if (_stat(path.c_str(), &st) != 0) return false;
+    if (!(st.st_mode & _S_IFREG)) return false;
+    return (_access(path.c_str(), 4) == 0);
+#else
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return false;
+    if (!S_ISREG(st.st_mode)) return false;
+    return (access(path.c_str(), R_OK) == 0);
+#endif
+}
+
+static bool isDirectoryWritable(const std::string& path) {
+#ifdef _WIN32
+    struct _stat st;
+    if (_stat(path.c_str(), &st) != 0) return false;
+    if (!(st.st_mode & _S_IFDIR)) return false;
+    return (_access(path.c_str(), 2) == 0);
+#else
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return false;
+    if (!S_ISDIR(st.st_mode)) return false;
+    return (access(path.c_str(), W_OK) == 0);
+#endif
+}
+
+static bool validateConsentFile(const std::string& path) {
+    if (!isRegularFileReadable(path)) {
+        std::cerr << "error: consent file not found or not readable: " << path << "\n";
+        return false;
+    }
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        std::cerr << "error: cannot open consent file: " << path << "\n";
+        return false;
+    }
+    std::string firstLine;
+    std::getline(f, firstLine);
+    while (!firstLine.empty() && (firstLine.back() == '\r' || firstLine.back() == ' '))
+        firstLine.pop_back();
+    if (firstLine != CONSENT_MAGIC) {
+        std::cerr << "error: consent file first line does not match required text.\n";
+        std::cerr << "  expected: \"" << CONSENT_MAGIC << "\"\n";
+        std::cerr << "  got:      \"" << firstLine << "\"\n";
+        return false;
+    }
+    return true;
 }
 
 int main(int argc, char* argv[]) {
     bool consent = false;
     bool help = false;
+    bool serviceMode = false;
+    std::string consentFilePath;
+    std::string logDir = ".";
+    std::string sessionTag;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--consent") == 0) {
             consent = true;
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             help = true;
+        } else if (std::strcmp(argv[i], "--service") == 0) {
+            serviceMode = true;
+        } else if (std::strcmp(argv[i], "--consent-file") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "error: --consent-file requires a path argument\n";
+                return 2;
+            }
+            consentFilePath = argv[++i];
+        } else if (std::strcmp(argv[i], "--log-dir") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "error: --log-dir requires a path argument\n";
+                return 2;
+            }
+            logDir = argv[++i];
+        } else if (std::strcmp(argv[i], "--session-tag") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "error: --session-tag requires a string argument\n";
+                return 2;
+            }
+            sessionTag = argv[++i];
+        } else {
+            std::cerr << "error: unknown option: " << argv[i] << "\n";
+            return 2;
         }
     }
 
@@ -92,6 +218,123 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // ---- Validate session-tag if provided (applies to both modes) ----
+    if (!sessionTag.empty() && !isValidSessionTag(sessionTag)) {
+        std::cerr << "error: --session-tag must be 1-64 characters, "
+                     "alphanumeric, dash, or underscore only. Got: \""
+                  << sessionTag << "\"\n";
+        return 2;
+    }
+
+#ifdef _WIN32
+    static constexpr const char* OS_NAME = "windows";
+#elif defined(__APPLE__)
+    static constexpr const char* OS_NAME = "macos";
+#else
+    static constexpr const char* OS_NAME = "linux";
+#endif
+
+    // ---- Service mode path ----
+    if (serviceMode) {
+        if (consent) {
+            std::cerr << "warning: --consent is ignored in --service mode\n";
+        }
+
+        if (consentFilePath.empty()) {
+            std::cerr << "error: --service requires --consent-file <path>\n";
+            return 2;
+        }
+
+        if (!validateConsentFile(consentFilePath)) {
+            return 2;
+        }
+
+        if (!isDirectoryWritable(logDir)) {
+            std::cerr << "error: --log-dir does not exist or is not writable: "
+                      << logDir << "\n";
+            return 2;
+        }
+
+        // Signals
+        std::signal(SIGINT,  signalHandler);
+        std::signal(SIGTERM, signalHandler);
+#if !defined(_WIN32)
+        std::signal(SIGHUP, signalHandler);
+#else
+        SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
+#endif
+
+        Logger logger(OS_NAME, logDir, sessionTag);
+        logger.start();
+
+        // Write service_start event with embedded banner
+        {
+            auto nowMs = static_cast<int64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+
+            std::string tagField = sessionTag.empty()
+                ? "null"
+                : "\"" + jsonEscape(sessionTag) + "\"";
+
+            std::string event;
+            event.reserve(1024);
+            event += R"({"event":"service_start","ts":")";
+            event += msToIso8601(nowMs);
+            event += R"(","os":")";
+            event += OS_NAME;
+            event += R"(","consent_file":")";
+            event += jsonEscape(consentFilePath);
+            event += R"(","session_tag":)";
+            event += tagField;
+            event += R"(,"banner":")";
+            event += jsonEscape(BANNER_TEXT);
+            event += R"("})";
+
+            logger.logEvent(event);
+        }
+
+        IKeylogger* keylogger = createPlatformKeylogger();
+        if (!keylogger) {
+            logger.stop();
+            return 1;
+        }
+
+        keylogger->setEventCallback([&logger, &sessionTag](const KeyEvent& ev) {
+            std::string tagField = sessionTag.empty()
+                ? "null"
+                : "\"" + jsonEscape(sessionTag) + "\"";
+
+            char buf[640];
+            snprintf(buf, sizeof(buf),
+                     R"({"ts":"%s","vk":%u,"key":"%s","down":%s,"os":"%s","session_tag":%s})",
+                     msToIso8601(ev.timestampMs).c_str(),
+                     ev.virtualKey,
+                     jsonEscape(ev.translated).c_str(),
+                     ev.keyDown ? "true" : "false",
+                     OS_NAME,
+                     tagField.c_str());
+            logger.logEvent(buf);
+        });
+
+        if (!keylogger->start()) {
+            std::cerr << "Failed to start keylogger\n";
+            delete keylogger;
+            logger.stop();
+            return 1;
+        }
+
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        keylogger->stop();
+        delete keylogger;
+        logger.stop();
+        return 0;
+    }
+
+    // ---- Interactive mode path (unchanged default) ----
     printBanner();
 
     if (!consent) {
@@ -103,28 +346,28 @@ int main(int argc, char* argv[]) {
 
     std::signal(SIGINT,  signalHandler);
     std::signal(SIGTERM, signalHandler);
-#ifdef _WIN32
+#if !defined(_WIN32)
+    std::signal(SIGHUP, signalHandler);
+#else
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
 #endif
 
-#ifdef _WIN32
-    static constexpr const char* OS_NAME = "windows";
-#elif defined(__APPLE__)
-    static constexpr const char* OS_NAME = "macos";
-#else
-    static constexpr const char* OS_NAME = "linux";
-#endif
-    Logger logger(OS_NAME);
+    Logger logger(OS_NAME, logDir, sessionTag);
     logger.start();
 
     {
         auto nowMs = static_cast<int64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
-        char hdr[256];
+
+        std::string tagField = sessionTag.empty()
+            ? "null"
+            : "\"" + jsonEscape(sessionTag) + "\"";
+
+        char hdr[512];
         snprintf(hdr, sizeof(hdr),
-                 R"({"event":"session_start","os":"%s","version":"0.1.0","ts":"%s"})",
-                 OS_NAME, msToIso8601(nowMs).c_str());
+                 R"({"event":"session_start","os":"%s","version":"0.1.0","ts":"%s","session_tag":%s})",
+                 OS_NAME, msToIso8601(nowMs).c_str(), tagField.c_str());
         logger.logEvent(hdr);
     }
 
@@ -134,15 +377,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    keylogger->setEventCallback([&logger](const KeyEvent& ev) {
-        char buf[512];
+    keylogger->setEventCallback([&logger, &sessionTag](const KeyEvent& ev) {
+        std::string tagField = sessionTag.empty()
+            ? "null"
+            : "\"" + jsonEscape(sessionTag) + "\"";
+
+        char buf[640];
         snprintf(buf, sizeof(buf),
-                 R"({"ts":"%s","vk":%u,"key":"%s","down":%s,"os":"%s"})",
+                 R"({"ts":"%s","vk":%u,"key":"%s","down":%s,"os":"%s","session_tag":%s})",
                  msToIso8601(ev.timestampMs).c_str(),
                  ev.virtualKey,
                  jsonEscape(ev.translated).c_str(),
                  ev.keyDown ? "true" : "false",
-                 OS_NAME);
+                 OS_NAME,
+                 tagField.c_str());
         logger.logEvent(buf);
     });
 
