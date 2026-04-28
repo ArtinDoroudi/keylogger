@@ -9,9 +9,13 @@ set(SOURCES
     src/logger.cpp
     src/platform/keylogger_factory.cpp
     # Platform-specific sources (uncomment when implemented):
-    # src/platform/windows_hook.cpp   # WIN32 only
+    # src/platform/windows_hook.cpp   # WIN32 only (superseded by keylogger_win.cpp)
     # src/platform/macos_hook.cpp     # APPLE only
 )
+
+if(WIN32)
+    list(APPEND SOURCES src/platform/keylogger_win.cpp)
+endif()
 
 add_executable(keylogger ${SOURCES})
 
