@@ -1,0 +1,10 @@
+build/
+*.o
+*.exe
+.DS_Store
+.vscode/
+.idea/
+CMakeFiles/
+CMakeCache.txt
+*.log
+*.json
