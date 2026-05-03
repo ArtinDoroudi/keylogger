@@ -1,7 +1,6 @@
 #ifdef __APPLE__
 
 #include <Carbon/Carbon.h>
-#import <Cocoa/Cocoa.h>
 
 #include <chrono>
 #include <cstdio>
@@ -104,73 +103,55 @@ struct WindowInfo { std::string app; std::string title; };
 
 static WindowInfo getActiveWindowInfo() {
     WindowInfo info;
-    @autoreleasepool {
-        NSRunningApplication* front =
-            [[NSWorkspace sharedWorkspace] frontmostApplication];
-        if (!front) return info;
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (!windowList) return info;
 
-        if (front.localizedName)
-            info.app = [front.localizedName UTF8String];
+    CFIndex count = CFArrayGetCount(windowList);
+    for (CFIndex i = 0; i < count; ++i) {
+        auto dict = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, i);
 
-        pid_t pid = front.processIdentifier;
-        CFArrayRef windowList = CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-            kCGNullWindowID);
-        if (!windowList) return info;
-
-        CFIndex count = CFArrayGetCount(windowList);
-        for (CFIndex i = 0; i < count; ++i) {
-            auto dict = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, i);
-
-            CFNumberRef pidRef = (CFNumberRef)CFDictionaryGetValue(
-                dict, kCGWindowOwnerPID);
-            if (!pidRef) continue;
-            int winPid = 0;
-            CFNumberGetValue(pidRef, kCFNumberIntType, &winPid);
-            if (winPid != pid) continue;
-
-            CFNumberRef layerRef = (CFNumberRef)CFDictionaryGetValue(
-                dict, kCGWindowLayer);
-            if (layerRef) {
-                int layer = 0;
-                CFNumberGetValue(layerRef, kCFNumberIntType, &layer);
-                if (layer != 0) continue;
-            }
-
-            CFStringRef nameRef = (CFStringRef)CFDictionaryGetValue(
-                dict, kCGWindowName);
-            if (nameRef) {
-                char buf[512];
-                if (CFStringGetCString(nameRef, buf, sizeof(buf),
-                                       kCFStringEncodingUTF8))
-                    info.title = buf;
-            }
-            break;
+        CFNumberRef layerRef = (CFNumberRef)CFDictionaryGetValue(
+            dict, kCGWindowLayer);
+        if (layerRef) {
+            int layer = 0;
+            CFNumberGetValue(layerRef, kCFNumberIntType, &layer);
+            if (layer != 0) continue;
         }
-        CFRelease(windowList);
+
+        // First layer-0 entry is the frontmost regular window.
+        CFStringRef ownerName = (CFStringRef)CFDictionaryGetValue(
+            dict, kCGWindowOwnerName);
+        if (ownerName) {
+            char buf[256];
+            if (CFStringGetCString(ownerName, buf, sizeof(buf),
+                                   kCFStringEncodingUTF8))
+                info.app = buf;
+        }
+
+        CFStringRef winName = (CFStringRef)CFDictionaryGetValue(
+            dict, kCGWindowName);
+        if (winName) {
+            char buf[512];
+            if (CFStringGetCString(winName, buf, sizeof(buf),
+                                   kCFStringEncodingUTF8))
+                info.title = buf;
+        }
+        break;
     }
+    CFRelease(windowList);
     return info;
 }
 
 static WindowInfo getCachedWindowInfo() {
-    static pid_t lastPID = -1;
     static WindowInfo cached;
     static auto lastRefresh = std::chrono::steady_clock::time_point{};
 
-    @autoreleasepool {
-        NSRunningApplication* front =
-            [[NSWorkspace sharedWorkspace] frontmostApplication];
-        pid_t currentPID = front ? front.processIdentifier : -1;
-
-        auto now = std::chrono::steady_clock::now();
-        bool pidChanged = (currentPID != lastPID);
-        bool stale = (now - lastRefresh) > std::chrono::milliseconds(500);
-
-        if (pidChanged || stale) {
-            cached = getActiveWindowInfo();
-            lastPID = currentPID;
-            lastRefresh = now;
-        }
+    auto now = std::chrono::steady_clock::now();
+    if ((now - lastRefresh) > std::chrono::milliseconds(100)) {
+        cached = getActiveWindowInfo();
+        lastRefresh = now;
     }
     return cached;
 }
