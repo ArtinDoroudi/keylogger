@@ -564,14 +564,16 @@ int main(int argc, char* argv[]) {
                 ? "null"
                 : "\"" + jsonEscape(sessionTag) + "\"";
 
-            char buf[640];
+            char buf[1024];
             snprintf(buf, sizeof(buf),
-                     R"({"ts":"%s","vk":%u,"key":"%s","down":%s,"os":"%s","session_tag":%s})",
+                     R"({"ts":"%s","vk":%u,"key":"%s","down":%s,"os":"%s","app":"%s","window":"%s","session_tag":%s})",
                      msToIso8601(ev.timestampMs).c_str(),
                      ev.virtualKey,
                      jsonEscape(ev.translated).c_str(),
                      ev.keyDown ? "true" : "false",
                      OS_NAME,
+                     jsonEscape(ev.appName).c_str(),
+                     jsonEscape(ev.windowTitle).c_str(),
                      tagField.c_str());
             sink.emit(buf);
         });
@@ -668,14 +670,16 @@ int main(int argc, char* argv[]) {
             ? "null"
             : "\"" + jsonEscape(sessionTag) + "\"";
 
-        char buf[640];
+        char buf[1024];
         snprintf(buf, sizeof(buf),
-                 R"({"ts":"%s","vk":%u,"key":"%s","down":%s,"os":"%s","session_tag":%s})",
+                 R"({"ts":"%s","vk":%u,"key":"%s","down":%s,"os":"%s","app":"%s","window":"%s","session_tag":%s})",
                  msToIso8601(ev.timestampMs).c_str(),
                  ev.virtualKey,
                  jsonEscape(ev.translated).c_str(),
                  ev.keyDown ? "true" : "false",
                  OS_NAME,
+                 jsonEscape(ev.appName).c_str(),
+                 jsonEscape(ev.windowTitle).c_str(),
                  tagField.c_str());
         sink.emit(buf);
     });

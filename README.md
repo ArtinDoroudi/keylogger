@@ -1,4 +1,4 @@
-# ethical-keylogger-demo
+# keylogger-demo
 
 Keystroke logger with optional remote log shipping via HTTP POST.
 
@@ -47,7 +47,7 @@ When `--net-mode` is `mirror` or `net-only`, each keystroke event is HTTP POSTed
 POST /logs HTTP/1.1
 Content-Type: application/json
 
-{"ts":"2026-05-02T17:30:45.123Z","vk":65,"key":"a","down":true,"os":"macos","session_tag":null}
+{"ts":"2026-05-02T17:30:45.123Z","vk":65,"key":"a","down":true,"os":"macos","app":"Firefox","window":"Google Search","session_tag":null}
 ```
 
 Your server just needs to accept the POST and return 200. Events are sent on a background thread and never block keystroke capture. Failed sends are retried with backoff, then dropped.
@@ -78,7 +78,7 @@ Run on your VPS: `python3 receiver.py`
 Newline-delimited JSON (`.jsonl`). Each event:
 
 ```json
-{"ts":"2026-05-02T14:30:00.123Z","vk":65,"key":"a","down":true,"os":"linux","session_tag":"lab-01"}
+{"ts":"2026-05-02T14:30:00.123Z","vk":65,"key":"a","down":true,"os":"linux","app":"Terminal","window":"zsh","session_tag":"lab-01"}
 ```
 
 ## Service install

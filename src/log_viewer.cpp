@@ -66,6 +66,7 @@ int main(int argc, char* argv[]) {
     std::string firstEventTs, lastEventTs;
     int         totalEvents = 0;
     std::string reconstructed;
+    std::string lastApp, lastWindow;
 
     std::string line;
     while (std::getline(f, line)) {
@@ -78,10 +79,21 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        if (!extractBool(line, "down")) continue; // skip key-up events
+        if (!extractBool(line, "down")) continue;
 
-        std::string key = extractString(line, "key");
-        std::string ts  = extractString(line, "ts");
+        std::string key    = extractString(line, "key");
+        std::string ts     = extractString(line, "ts");
+        std::string app    = extractString(line, "app");
+        std::string window = extractString(line, "window");
+
+        if (app != lastApp || window != lastWindow) {
+            if (!reconstructed.empty()) reconstructed += "\n";
+            reconstructed += "--- [" + (app.empty() ? "?" : app) + "] "
+                           + (window.empty() ? "(untitled)" : window) + " ---\n";
+            lastApp    = app;
+            lastWindow = window;
+        }
+
         if (firstEventTs.empty()) firstEventTs = ts;
         lastEventTs = ts;
         ++totalEvents;

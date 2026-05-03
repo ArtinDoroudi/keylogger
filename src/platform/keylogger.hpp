@@ -9,6 +9,8 @@ struct KeyEvent {
     std::string translated;
     int64_t     timestampMs;
     bool        keyDown;
+    std::string appName;
+    std::string windowTitle;
 };
 
 class IKeylogger {
